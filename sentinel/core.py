@@ -1,6 +1,36 @@
 """
-Sentinel - Minimal Observer + Diagnostic Report Builder
-Follows the DiagnosticReport JSON schema from design spec.
+Sentinel - Production Observer & Diagnostic Reporter
+
+ROLE: Detect real system issues, build structured diagnostic reports,
+      and send them to OpenClaw for safe execution.
+
+HARD RULES:
+  - NEVER execute any action (no restart, no fix)
+  - NEVER send raw logs without filtering
+  - NEVER spam duplicate events
+  - NEVER send incomplete or malformed reports
+  - NEVER trigger on single transient failure
+  - If uncertain -> DO NOT emit event
+
+EVENT GENERATION:
+  Only emit if:
+  - At least 2 signals correlate, OR
+  - A critical signal persists for 3 consecutive checks
+
+EVENT TYPES (strict):
+  OOM_CRASH, RESTART_LOOP, API_DOWN, CADDY_502, DISK_FULL
+
+CONFIDENCE THRESHOLD:
+  - 0.9 -> strong correlation
+  - 0.7 -> moderate evidence
+  - below 0.6 -> DO NOT emit
+
+DEDUPLICATION:
+  - Same event_type + service within 5 minutes -> skip
+
+TEMPORAL VALIDATION:
+  - Issue must persist for at least 2-3 checks
+  - Ignore short spikes
 """
 import os
 import json
@@ -9,12 +39,11 @@ import hashlib
 import logging
 import argparse
 from datetime import datetime
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Tuple
 
 try:
     import docker
 except ImportError:
-    print("Installing docker...")
     import subprocess
     subprocess.run(["pip", "install", "docker"], check=True)
     import docker
@@ -22,394 +51,516 @@ except ImportError:
 try:
     import psutil
 except ImportError:
-    print("Installing psutil...")
     import subprocess
     subprocess.run(["pip", "install", "psutil"], check=True)
     import psutil
 
+try:
+    import requests
+except ImportError:
+    import subprocess
+    subprocess.run(["pip", "install", "requests"], check=True)
+    import requests
+
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s [SENTINEL] %(levelname)s %(message)s'
+    format="%(asctime)s [SENTINEL] %(levelname)s %(message)s"
 )
 logger = logging.getLogger("sentinel")
 
 
+SIGNAL_HIGH_MEMORY = "HIGH_MEMORY"
+SIGNAL_HIGH_CPU = "HIGH_CPU"
+SIGNAL_RESTART_LOOP = "RESTART_LOOP"
+SIGNAL_DISK_FULL = "DISK_FULL"
+SIGNAL_API_DOWN = "API_DOWN"
+SIGNAL_ERROR_LOG = "ERROR_LOG_DETECTED"
+SIGNAL_OOM_LOG = "OOM_DETECTED"
+SIGNAL_502_LOG = "GATEWAY_502"
+
+THRESHOLD_MEMORY_PCT = 85.0
+THRESHOLD_CPU_PCT = 90.0
+THRESHOLD_DISK_PCT = 90.0
+THRESHOLD_RESTART_COUNT = 3
+
+MIN_SIGNALS_FOR_EVENT = 2
+MIN_CONFIDENCE_TO_EMIT = 0.6
+PERSISTENCE_CHECKS_REQUIRED = 2
+
+EVENT_TYPES = ["OOM_CRASH", "RESTART_LOOP", "API_DOWN", "CADDY_502", "DISK_FULL"]
+SEVERITY_LEVELS = ["low", "medium", "high", "critical"]
+
+LOG_FILTER_KEYWORDS = ["error", "exception", "fatal", "oom", "killed", "failed", "502", "bad gateway"]
+LOG_MAX_LINES = 20
+LOG_TAIL_SIZE = 100
+
+
 class SentinelConfig:
-    """Configuration from environment"""
-    # OpenClaw endpoint
     OPENCLAW_URL = os.getenv("OPENCLAW_URL", "http://biodockify-openclaw:8001")
-    
-    # Monitoring settings
     CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "120"))
     COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "300"))
-    
-    # Services to monitor
-    MONITORED_SERVICES = os.getenv(
-        "MONITORED_SERVICES",
-        "biodockify-api,biodockify-docking-worker,biodockify-ranking-worker,biodockify-md-worker"
-    ).split(",")
-    
-    # Auto-heal settings per service
+    MONITORED_SERVICES = [
+        s.strip()
+        for s in os.getenv(
+            "MONITORED_SERVICES",
+            "biodockify-api,biodockify-docking-worker,biodockify-ranking-worker,biodockify-md-worker,caddy-reverse",
+        ).split(",")
+        if s.strip()
+    ]
     AUTO_HEAL = os.getenv("AUTO_HEAL", "true").lower() == "true"
+    PERSISTENCE_WINDOW = int(os.getenv("PERSISTENCE_WINDOW", "3"))
 
 
 class DiagnosticReport:
-    """Structured Diagnostic Report following JSON Schema"""
-    
-    REQUIRED_FIELDS = ["event_id", "event_type", "service", "severity", "timestamp"]
-    EVENT_TYPES = ["OOM_CRASH", "RESTART_LOOP", "API_DOWN", "CADDY_502", "QUEUE_BACKLOG", "DISK_FULL", "UNKNOWN"]
-    SEVERITY_LEVELS = ["low", "medium", "high", "critical"]
-    
     def __init__(self, data: Dict):
         self.data = data
         self._validate()
-    
+
     def _validate(self):
-        """Validate required fields"""
-        for field in self.REQUIRED_FIELDS:
-            if field not in self.data:
-                raise ValueError(f"Missing required field: {field}")
-        
-        if self.data["event_type"] not in self.EVENT_TYPES:
-            logger.warning(f"Unknown event_type: {self.data['event_type']}, setting to UNKNOWN")
-            self.data["event_type"] = "UNKNOWN"
-        
-        if self.data["severity"] not in self.SEVERITY_LEVELS:
-            self.data["severity"] = "medium"
-    
+        required = ["event_id", "event_type", "service", "severity", "timestamp"]
+        for f in required:
+            if f not in self.data:
+                raise ValueError(f"Missing required field: {f}")
+        if self.data["event_type"] not in EVENT_TYPES:
+            raise ValueError(f"Invalid event_type: {self.data['event_type']}")
+        if self.data["severity"] not in SEVERITY_LEVELS:
+            raise ValueError(f"Invalid severity: {self.data['severity']}")
+
     def to_json(self) -> str:
         return json.dumps(self.data, indent=2)
-    
+
     def to_dict(self) -> Dict:
         return self.data.copy()
 
 
+class PersistenceTracker:
+    """Track how long signals persist across checks"""
+
+    def __init__(self):
+        self._history: Dict[str, List[Dict]] = {}
+
+    def record(self, service: str, signals: List[str], event_type: str):
+        key = f"{service}:{event_type}"
+        entry = {"signals": signals, "timestamp": time.time()}
+        if key not in self._history:
+            self._history[key] = []
+        self._history[key].append(entry)
+        self._history[key] = self._history[key][-10:]
+
+    def get_persistence_count(self, service: str, event_type: str) -> int:
+        key = f"{service}:{event_type}"
+        if key not in self._history:
+            return 0
+        return len(self._history[key])
+
+    def clear(self, service: str, event_type: str):
+        key = f"{service}:{event_type}"
+        if key in self._history:
+            del self._history[key]
+
+
 class Sentinel:
-    """Minimal Sentinel - Observer Only"""
-    
+    """Production Observer - detects, classifies, reports. NO execution."""
+
     def __init__(self, config: SentinelConfig = None):
         self.config = config or SentinelConfig()
         self.docker_client = docker.from_env()
-        self.last_events = {}  # cooldown tracking
-        self.stats = {"reports_emit": 0, "reports_skipped": 0}
-    
-    def collect(self, service_name: str) -> DiagnosticReport:
-        """Collect diagnostic data and build report"""
+        self.last_events: Dict[str, float] = {}
+        self.persistence = PersistenceTracker()
+        self.stats = {
+            "checks": 0,
+            "events_detected": 0,
+            "events_emitted": 0,
+            "events_skipped_cooldown": 0,
+            "events_skipped_confidence": 0,
+            "events_skipped_persistence": 0,
+            "send_success": 0,
+            "send_failed": 0,
+        }
+
+    def check_service(self, service_name: str) -> Optional[Dict]:
+        """Collect raw state for a service. Returns None if healthy."""
+        self.stats["checks"] += 1
+
         try:
             container = self.docker_client.containers.get(service_name)
-            return self._build_report(service_name, container)
         except docker.errors.NotFound:
-            return self._build_report(service_name, None, event_type="SERVICE_NOT_FOUND")
+            return self._build_raw_state(service_name, None, signals=[SIGNAL_API_DOWN])
         except Exception as e:
-            logger.error(f"Error collecting {service_name}: {e}")
-            return self._build_report(service_name, None, event_type="UNKNOWN")
-    
-    def _build_report(
-        self, 
-        service: str, 
-        container, 
-        event_type: str = None,
-        override_data: Dict = None
-    ) -> DiagnosticReport:
-        """Build diagnostic report"""
-        now = int(time.time())
-        
-        # Default data
-        data = {
-            "event_id": "",
-            "event_type": event_type or "UNKNOWN",
-            "service": service,
-            "severity": "medium",
-            "summary": {"status": "unknown", "restart_count": 0, "uptime_seconds": 0},
-            "system_state": {"memory_pct": 0, "cpu_pct": 0, "disk_pct": 0},
-            "container_state": {"status": "unknown", "exit_code": None, "exit_reason": None},
-            "recent_logs": [],
-            "signals": [],
-            "timeline": [],
-            "confidence": 0.3,
-            "timestamp": now
+            logger.error(f"Error checking {service_name}: {e}")
+            return None
+
+        attrs = container.attrs
+        state = attrs.get("State", {})
+
+        container_state = {
+            "status": state.get("Status", "unknown"),
+            "exit_code": state.get("ExitCode"),
+            "exit_reason": state.get("Error", ""),
+            "restart_count": attrs.get("RestartCount", 0),
         }
-        
-        if container is None:
-            data["severity"] = "critical"
-            data["event_type"] = "SERVICE_NOT_FOUND"
-            data["signals"].append("CONTAINER_MISSING")
-        else:
-            # Container state
-            attrs = container.attrs
-            state = attrs.get("State", {})
-            
-            data["container_state"] = {
-                "status": state.get("Status", "unknown"),
-                "exit_code": state.get("ExitCode"),
-                "exit_reason": state.get("Error")
+
+        system_state = self._get_system_metrics()
+
+        raw_logs = ""
+        try:
+            raw_logs = container.logs(
+                tail=LOG_TAIL_SIZE, stderr=True, stdout=True
+            ).decode("utf-8", errors="ignore")
+        except Exception:
+            pass
+
+        filtered_logs = self._filter_logs(raw_logs)
+
+        signals = self._detect_signals(
+            container_state, system_state, filtered_logs
+        )
+
+        return {
+            "service": service_name,
+            "container_state": container_state,
+            "system_state": system_state,
+            "filtered_logs": filtered_logs,
+            "signals": signals,
+            "uptime": self._calculate_uptime(attrs),
+        }
+
+    def _get_system_metrics(self) -> Dict:
+        try:
+            return {
+                "memory_pct": round(psutil.virtual_memory().percent, 1),
+                "cpu_pct": round(psutil.cpu_percent(interval=0.5), 1),
+                "disk_pct": round(psutil.disk_usage("/").percent, 1),
             }
-            data["summary"] = {
-                "status": state.get("Status", "unknown"),
-                "restart_count": attrs.get("RestartCount", 0),
-                "uptime_seconds": self._calculate_uptime(attrs)
-            }
-            
-            # System metrics
-            try:
-                mem = psutil.virtual_memory()
-                cpu = psutil.cpu_percent(interval=0.5)
-                disk = psutil.disk_usage('/')
-                
-                data["system_state"] = {
-                    "memory_pct": round(mem.percent, 1),
-                    "cpu_pct": round(cpu, 1),
-                    "disk_pct": round(disk.percent, 1)
-                }
-            except Exception as e:
-                logger.warning(f"Failed to get system metrics: {e}")
-            
-            # Logs
-            try:
-                logs = container.logs(tail=100, stderr=True, stdout=True).decode('utf-8', errors='ignore')
-                error_lines = [
-                    l for l in logs.split('\n')[-50:] 
-                    if any(k in l.lower() for k in ['error', 'exception', 'fatal', 'oom', 'killed', 'failed'])
-                ]
-                data["recent_logs"] = error_lines[-20:]  # Max 20 lines
-            except Exception as e:
-                logger.warning(f"Failed to get logs: {e}")
-            
-            # Event classification
-            event_type, signals, severity = self._classify(
-                data["system_state"],
-                data["container_state"],
-                data["recent_logs"]
-            )
-            data["event_type"] = event_type
-            data["signals"] = signals
-            data["severity"] = severity
-            
-            # Confidence
-            data["confidence"] = self._calculate_confidence(event_type, signals, data["recent_logs"])
-            
-            # Timeline
-            data["timeline"] = self._build_timeline(attrs, data["recent_logs"])
-        
-        # Generate event_id for idempotency
-        data["event_id"] = self._generate_event_id(data["event_type"], service, now)
-        
-        # Override any specific data
-        if override_data:
-            data.update(override_data)
-        
-        return DiagnosticReport(data)
-    
-    def _classify(
+        except Exception:
+            return {"memory_pct": 0, "cpu_pct": 0, "disk_pct": 0}
+
+    def _filter_logs(self, raw_logs: str) -> List[str]:
+        """Keep ONLY error lines. Max 20. No noise."""
+        if not raw_logs:
+            return []
+        lines = raw_logs.split("\n")
+        filtered = [
+            line.strip()
+            for line in lines
+            if any(k in line.lower() for k in LOG_FILTER_KEYWORDS)
+        ]
+        return [l for l in filtered if l][-LOG_MAX_LINES:]
+
+    def _detect_signals(
         self,
-        system_state: Dict,
         container_state: Dict,
-        logs: List[str]
-    ) -> tuple:
-        """Classify event type from signals"""
-        event_type = "UNKNOWN"
+        system_state: Dict,
+        filtered_logs: List[str],
+    ) -> List[str]:
+        """Generate signals from raw data. NOT events yet."""
         signals = []
-        severity = "medium"
-        
-        mem_pct = system_state.get("memory_pct", 0)
-        log_text = ' '.join(logs).lower()
-        
-        # OOM detection
-        if mem_pct > 90 or 'oom' in log_text or 'killed' in log_text:
-            event_type = "OOM_CRASH"
-            signals.append("HIGH_MEMORY")
-            severity = "critical"
-        
-        # Restart loop
-        elif container_state.get("status") == "restarting":
-            event_type = "RESTART_LOOP"
-            signals.append("RESTART_LOOP")
-            severity = "high"
-        
-        # Check exit code
-        exit_code = container_state.get("exit_code")
-        if exit_code == 137:
-            event_type = "OOM_CRASH"
-            signals.append("SIGKILL")
-            severity = "critical"
-        elif exit_code == 1:
-            event_type = "API_DOWN"
-            signals.append("EXIT_ERROR")
-            severity = "high"
-        
-        # Disk full
-        disk_pct = system_state.get("disk_pct", 0)
-        if disk_pct > 90:
-            event_type = "DISK_FULL"
-            signals.append("HIGH_DISK")
-            severity = "critical"
-        
-        return event_type, signals, severity
-    
-    def _calculate_confidence(self, event_type: str, signals: List[str], logs: List[str]) -> float:
-        """Calculate confidence in classification"""
-        if event_type == "UNKNOWN":
-            return 0.3
-        
+        log_text = " ".join(filtered_logs).lower()
+
+        if system_state.get("memory_pct", 0) > THRESHOLD_MEMORY_PCT:
+            signals.append(SIGNAL_HIGH_MEMORY)
+
+        if system_state.get("cpu_pct", 0) > THRESHOLD_CPU_PCT:
+            signals.append(SIGNAL_HIGH_CPU)
+
+        if system_state.get("disk_pct", 0) > THRESHOLD_DISK_PCT:
+            signals.append(SIGNAL_DISK_FULL)
+
+        if container_state.get("restart_count", 0) >= THRESHOLD_RESTART_COUNT:
+            signals.append(SIGNAL_RESTART_LOOP)
+
+        if container_state.get("status") == "restarting":
+            signals.append(SIGNAL_RESTART_LOOP)
+
+        if container_state.get("exit_code") == 137:
+            signals.append(SIGNAL_OOM_LOG)
+
+        if filtered_logs:
+            signals.append(SIGNAL_ERROR_LOG)
+
+        if "oom" in log_text or "killed" in log_text:
+            signals.append(SIGNAL_OOM_LOG)
+
+        if "502" in log_text or "bad gateway" in log_text:
+            signals.append(SIGNAL_502_LOG)
+
+        if container_state.get("exit_code") == 1:
+            signals.append(SIGNAL_API_DOWN)
+
+        return list(set(signals))
+
+    def _classify_event(
+        self, signals: List[str], system_state: Dict, filtered_logs: List[str]
+    ) -> Tuple[str, str]:
+        """Lightweight classification. Suggests cause, does NOT overfit."""
+        log_text = " ".join(filtered_logs).lower()
+
+        if SIGNAL_OOM_LOG in signals or (
+            SIGNAL_HIGH_MEMORY in signals and "oom" in log_text
+        ):
+            return "OOM_CRASH", "critical"
+
+        if SIGNAL_RESTART_LOOP in signals:
+            return "RESTART_LOOP", "high"
+
+        if SIGNAL_502_LOG in signals:
+            return "CADDY_502", "high"
+
+        if SIGNAL_DISK_FULL in signals:
+            return "DISK_FULL", "critical"
+
+        if SIGNAL_API_DOWN in signals:
+            return "API_DOWN", "high"
+
+        return "", "medium"
+
+    def _calculate_confidence(
+        self, event_type: str, signals: List[str], filtered_logs: List[str]
+    ) -> float:
+        """Confidence scoring. Below 0.6 = do NOT emit."""
+        if not event_type:
+            return 0.0
+
+        score = 0.4
         signal_count = len(signals)
-        
+
         if signal_count >= 3:
-            return 0.95
+            score += 0.4
         elif signal_count >= 2:
-            return 0.8
+            score += 0.3
         elif signal_count == 1:
-            return 0.6
-        
-        # Check logs for more evidence
-        if logs and any('error' in l.lower() for l in logs[:5]):
-            return 0.7
-        
-        return 0.5
-    
-    def _generate_event_id(self, event_type: str, service: str, timestamp: int) -> str:
-        """Generate idempotent event ID with time window"""
-        # 60 second window
-        time_window = timestamp // 60
-        key = f"{event_type}:{service}:{time_window}"
+            score += 0.1
+
+        log_text = " ".join(filtered_logs).lower()
+        if event_type == "OOM_CRASH" and ("oom" in log_text or "killed" in log_text):
+            score += 0.2
+
+        if event_type == "CADDY_502" and "502" in log_text:
+            score += 0.2
+
+        if event_type == "RESTART_LOOP" and SIGNAL_RESTART_LOOP in signals:
+            score += 0.2
+
+        return min(round(score, 2), 1.0)
+
+    def should_emit(
+        self,
+        service: str,
+        event_type: str,
+        confidence: float,
+        signals: List[str],
+    ) -> Tuple[bool, str]:
+        """Determine if event should be emitted. Applies ALL rules."""
+
+        if not event_type:
+            return False, "no_event_type"
+
+        if confidence < MIN_CONFIDENCE_TO_EMIT:
+            self.stats["events_skipped_confidence"] += 1
+            return False, f"low_confidence_{confidence}"
+
+        persistence_count = self.persistence.get_persistence_count(service, event_type)
+
+        signal_count = len(signals)
+        if signal_count < MIN_SIGNALS_FOR_EVENT:
+            if persistence_count < PERSISTENCE_CHECKS_REQUIRED:
+                self.stats["events_skipped_persistence"] += 1
+                return False, f"insufficient_persistence_{persistence_count}"
+
+        key = f"{event_type}:{service}"
+        now = time.time()
+        if key in self.last_events:
+            if now - self.last_events[key] < self.config.COOLDOWN_SECONDS:
+                self.stats["events_skipped_cooldown"] += 1
+                return False, "cooldown"
+
+        return True, "ok"
+
+    def build_report(
+        self,
+        service: str,
+        event_type: str,
+        severity: str,
+        raw_state: Dict,
+        confidence: float,
+    ) -> DiagnosticReport:
+        now = int(time.time())
+        cs = raw_state.get("container_state", {})
+        ss = raw_state.get("system_state", {})
+        logs = raw_state.get("filtered_logs", [])
+        signals = raw_state.get("signals", [])
+
+        data = {
+            "event_id": self._generate_event_id(event_type, service, now),
+            "event_type": event_type,
+            "service": service,
+            "severity": severity,
+            "summary": {
+                "status": cs.get("status", "unknown"),
+                "restart_count": cs.get("restart_count", 0),
+                "uptime_seconds": raw_state.get("uptime", 0),
+            },
+            "system_state": ss,
+            "container_state": {
+                "status": cs.get("status", "unknown"),
+                "exit_code": cs.get("exit_code"),
+                "exit_reason": cs.get("exit_reason", ""),
+            },
+            "recent_logs": logs[-LOG_MAX_LINES:],
+            "signals": signals,
+            "confidence": confidence,
+            "timestamp": now,
+        }
+
+        return DiagnosticReport(data)
+
+    def _generate_event_id(self, event_type: str, service: str, ts: int) -> str:
+        window = ts // 60
+        key = f"{event_type}:{service}:{window}"
         return hashlib.sha256(key.encode()).hexdigest()[:16]
-    
+
     def _calculate_uptime(self, attrs: Dict) -> int:
-        """Calculate container uptime in seconds"""
         try:
             started = attrs.get("State", {}).get("StartedAt")
             if started:
-                start_ts = datetime.fromisoformat(started.replace('Z', '+00:00')).timestamp()
-                return int(time.time() - start_ts)
-        except:
+                ts = datetime.fromisoformat(
+                    started.replace("Z", "+00:00")
+                ).timestamp()
+                return int(time.time() - ts)
+        except Exception:
             pass
         return 0
-    
-    def _build_timeline(self, attrs: Dict, logs: List[str]) -> List[str]:
-        """Build chronological timeline"""
-        timeline = []
-        
-        # Add restart count
-        restart_count = attrs.get("RestartCount", 0)
-        if restart_count > 0:
-            timeline.append(f"restart #{restart_count}")
-        
-        # Add log signals
-        if logs:
-            first_error = logs[0][:50] if logs else ""
-            if first_error:
-                timeline.append(first_error)
-        
-        return timeline[-5:]  # Last 5 events
-    
-    def should_emit(self, report: DiagnosticReport) -> bool:
-        """Check cooldown and emit conditions"""
-        key = f"{report.data['event_type']}:{report.data['service']}"
-        now = time.time()
-        
-        # Don't emit unknown events
-        if report.data['event_type'] == "UNKNOWN":
-            return False
-        
-        # Check cooldown
-        if key in self.last_events:
-            if now - self.last_events[key] < self.config.COOLDOWN_SECONDS:
-                self.stats["reports_skipped"] += 1
-                return False
-        
-        self.last_events[key] = now
-        self.stats["reports_emit"] += 1
-        return True
-    
+
+    def _build_raw_state(
+        self, service: str, container, signals: List[str]
+    ) -> Dict:
+        return {
+            "service": service,
+            "container_state": {
+                "status": "missing",
+                "exit_code": None,
+                "exit_reason": "container_not_found",
+                "restart_count": 0,
+            },
+            "system_state": self._get_system_metrics(),
+            "filtered_logs": [],
+            "signals": signals,
+            "uptime": 0,
+        }
+
     def send_report(self, report: DiagnosticReport) -> bool:
-        """Send report to OpenClaw"""
-        import requests
-        
         if not self.config.AUTO_HEAL:
-            logger.info(f"Auto-heal disabled, skipping OpenClaw")
             return True
-        
+
         try:
-            response = requests.post(
+            resp = requests.post(
                 f"{self.config.OPENCLAW_URL}/incident",
                 json=report.to_dict(),
                 headers={"Content-Type": "application/json"},
-                timeout=10
+                timeout=10,
             )
-            
-            if response.status_code == 200:
-                logger.info(f"Report sent: {report.data['event_id']}")
+            if resp.status_code == 200:
+                self.stats["send_success"] += 1
                 return True
-            else:
-                logger.warning(f"OpenClaw rejected: {response.status_code}")
-                return False
-                
-        except Exception as e:
-            logger.error(f"Failed to send report: {e}")
+            self.stats["send_failed"] += 1
             return False
-    
-    def verify_recovery(self, service: str) -> bool:
-        """Verify service recovered after fix"""
-        try:
-            container = self.docker_client.containers.get(service)
-            if container.status == 'running':
-                # Additional checks can be added here
-                return True
-        except:
-            pass
-        return False
-    
+        except Exception as e:
+            self.stats["send_failed"] += 1
+            logger.error(f"Send failed: {e}")
+            return False
+
+    def process_service(self, service: str):
+        """Full pipeline for one service: collect -> classify -> decide -> emit"""
+        raw_state = self.check_service(service)
+        if raw_state is None:
+            return
+
+        signals = raw_state.get("signals", [])
+        if not signals:
+            self.persistence.clear(service, "")
+            return
+
+        event_type, severity = self._classify_event(
+            signals,
+            raw_state.get("system_state", {}),
+            raw_state.get("filtered_logs", []),
+        )
+
+        if not event_type:
+            return
+
+        confidence = self._calculate_confidence(
+            event_type, signals, raw_state.get("filtered_logs", [])
+        )
+
+        self.persistence.record(service, signals, event_type)
+
+        emit, reason = self.should_emit(service, event_type, confidence, signals)
+
+        if emit:
+            self.stats["events_detected"] += 1
+            report = self.build_report(service, event_type, severity, raw_state, confidence)
+            if self.send_report(report):
+                self.stats["events_emitted"] += 1
+                key = f"{event_type}:{service}"
+                self.last_events[key] = time.time()
+                logger.info(
+                    f"[EMIT] {service} {event_type} "
+                    f"severity={severity} confidence={confidence} "
+                    f"signals={signals}"
+                )
+        else:
+            logger.debug(f"[SKIP] {service} {event_type}: {reason}")
+
     def run_loop(self):
-        """Main monitoring loop"""
-        logger.info(f"Starting Sentinel loop (interval={self.config.CHECK_INTERVAL}s)")
+        logger.info(f"Sentinel started (interval={self.config.CHECK_INTERVAL}s)")
         logger.info(f"Monitoring: {self.config.MONITORED_SERVICES}")
-        
+        logger.info(f"Rules: min_signals={MIN_SIGNALS_FOR_EVENT} min_confidence={MIN_CONFIDENCE_TO_EMIT} persistence={PERSISTENCE_CHECKS_REQUIRED}")
+
         while True:
             try:
                 for service in self.config.MONITORED_SERVICES:
-                    service = service.strip()
-                    if not service:
-                        continue
-                    
-                    report = self.collect(service)
-                    
-                    if self.should_emit(report):
-                        logger.info(
-                            f"[{service}] {report.data['event_type']} "
-                            f"(severity={report.data['severity']}, "
-                            f"confidence={report.data['confidence']})"
-                        )
-                        self.send_report(report)
-                    else:
-                        logger.debug(f"[{service}] OK, no emit")
-                
+                    self.process_service(service)
             except Exception as e:
-                logger.error(f"Sentinel loop error: {e}")
-            
+                logger.error(f"Loop error: {e}")
+
             time.sleep(self.config.CHECK_INTERVAL)
 
 
 def main():
     parser = argparse.ArgumentParser(description="BioDockify Sentinel")
-    parser.add_argument("--service", help="Single service to monitor")
-    parser.add_argument("--once", action="store_true", help="Run once instead of loop")
+    parser.add_argument("--service", help="Single service to check")
+    parser.add_argument("--once", action="store_true", help="Run once")
     args = parser.parse_args()
-    
+
     config = SentinelConfig()
-    
-    # Override service list if provided
     if args.service:
         config.MONITORED_SERVICES = [args.service]
-    
+
     sentinel = Sentinel(config)
-    
+
     if args.once:
-        # Run once
         for service in config.MONITORED_SERVICES:
-            report = sentinel.collect(service.strip())
-            print(f"\n=== {service} ===")
-            print(report.to_json())
+            raw = sentinel.check_service(service)
+            if raw:
+                signals = raw.get("signals", [])
+                event_type, severity = sentinel._classify_event(
+                    signals,
+                    raw.get("system_state", {}),
+                    raw.get("filtered_logs", []),
+                )
+                confidence = sentinel._calculate_confidence(
+                    event_type, signals, raw.get("filtered_logs", [])
+                )
+                print(f"\n=== {service} ===")
+                print(f"Signals: {signals}")
+                print(f"Event: {event_type} (severity={severity}, confidence={confidence})")
+                if event_type and confidence >= MIN_CONFIDENCE_TO_EMIT:
+                    report = sentinel.build_report(service, event_type, severity, raw, confidence)
+                    print(report.to_json())
+                else:
+                    print("No actionable event")
     else:
-        # Run loop
         sentinel.run_loop()
 
 

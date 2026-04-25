@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   sentinel:
     build:
@@ -7,50 +5,19 @@ services:
       dockerfile: Dockerfile
     container_name: biodockify-sentinel
     restart: unless-stopped
+    network_mode: host
     environment:
       - CHECK_INTERVAL=1800
       - COOLDOWN_SECONDS=300
-      - OPENCLAW_URL=http://biodockify-openclaw:8001
+      - OPENCLAW_URL=http://127.0.0.1:18789
       - MONITORED_SERVICES=biodockify-api,biodockify-docking-worker,biodockify-ranking-worker,biodockify-md-worker,caddy-reverse
       - AUTO_HEAL=true
-      - DATABASE_URL=postgresql://biodockify_user:biodockify_secure_pass@biodockify-postgres:5432/biodockify
+      - DATABASE_URL=postgresql://biodockify_user:biodockify_secure_pass@172.30.1.7:5432/biodockify
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - sentinel_data:/app/audit
-    networks:
-      - biodockify-network
-    depends_on:
-      - openclaw
     command: python -m sentinel.core
-
-  openclaw:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: biodockify-openclaw
-    restart: unless-stopped
-    environment:
-      - DRY_RUN=false
-      - SERVICE_POLICIES=biodockify-api:true,biodockify-docking-worker:true,biodockify-ranking-worker:true,biodockify-md-worker:true,caddy-reverse:true
-      - RATE_LIMIT_SECONDS=300
-      - VERIFY_WAIT_SECONDS=8
-      - VERIFY_RETRIES=3
-      - STEP_RETRY_ATTEMPTS=2
-      - DEDUP_TTL_SECONDS=600
-    ports:
-      - "8001:8001"
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - openclaw_data:/app/audit
-    networks:
-      - biodockify-network
-    command: gunicorn -w 2 -b 0.0.0.0:8001 "openclaw.engine:create_app()"
-
-networks:
-  biodockify-network:
-    external: true
-    name: biodockify_biodockify-network
 
 volumes:
   sentinel_data:
-  openclaw_data:
+    driver: local
